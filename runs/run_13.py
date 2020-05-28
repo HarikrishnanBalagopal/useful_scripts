@@ -12,297 +12,19 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
 from tqdm import tqdm
+
 from torch import nn, optim
-from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
+from text_decoder import TextDecoder
+from text_encoder import TextEncoder
 from easydict import EasyDict as edict
 from torch.nn.init import xavier_uniform_
 from misc.HybridCNNLong import HybridCNNLong
+from latent_generator import LatentGenerator
+from latent_discriminator import LatentDiscriminator
 from nltk.translate.bleu_score import sentence_bleu
 from torch.distributions.categorical import Categorical
 from text_datasets import get_emnlp_2017_news_combined_vocab, get_emnlp_2017_news_pretrained_vocab, get_quora_texts_pretrained_vocab
 from utils import GLOVE_5102_300_PATH, to_one_hot, QUORA_PARAPHRASE_PRETRAINED_PATH, QUORA_PARAPHRASE_PRETRAINED_CHECKPOINT_PATH, QUORA_PARAPHRASE_PRETRAINED_WORD_ID_TO_WORD_PATH, QUORA_PARAPHRASE_PRETRAINED_SPECIAL_TOKENS_PATH, QUORA_PARAPHRASE_PRETRAINED_DEFAULT_CONFIG_PATH, QUORA_TEXT_SPLITS_PATH, QUORA_TEXT_PRETRAINED_VOCAB_VALID_SET_PATH, QUORA_TEXT_PRETRAINED_VOCAB_TEST_SET_PATH
-
-
-# # Generator
-
-# In[2]:
-
-
-# BUGGY VERSION
-# def mask_in_place_and_calc_length(texts, text_log_probs, end_token, pad_token=0):
-#     t4 = (texts == end_token).cumsum(dim=1).bool()
-#     mask = torch.cat((torch.zeros(t4.size(0), 1, dtype=torch.bool, device=t4.device), t4[:, :-1]), dim=1)
-#     text_lens = mask.size(1) - mask.sum(dim=1)
-#     texts.masked_fill_(mask, pad_token)
-#     text_log_probs.masked_fill_(mask.unsqueeze(2), pad_token)
-#     return texts, text_log_probs, text_lens
-
-def mask_in_place_and_calc_length(texts, text_log_probs, end_token, pad_token=0):
-    t4 = (texts == end_token).cumsum(dim=1).bool()
-    mask = torch.cat((torch.zeros(t4.size(0), 1, dtype=torch.bool, device=t4.device), t4[:, :-1]), dim=1)
-    text_lens = mask.size(1) - mask.sum(dim=1)
-    texts.masked_fill_(mask, pad_token)
-    mask = mask.unsqueeze(2).expand_as(text_log_probs)
-    pad_mask = torch.zeros_like(mask)
-    pad_mask[:, :, pad_token] = True
-    text_log_probs.masked_fill_(mask, float('-inf'))
-    text_log_probs.masked_fill_(mask & pad_mask, 0.0)
-    return texts, text_log_probs, text_lens
-
-def testing():
-    d_batch = 2
-    d_max_seq_len = 8
-    d_vocab = 4
-    pad_token = 0
-    eos_token = 2
-
-    texts = torch.randint(low=0, high=d_vocab, size=(d_batch, d_max_seq_len))
-    print(texts)
-    text_log_probs = F.log_softmax(torch.randn(d_batch, d_max_seq_len, d_vocab), dim=2)
-    print(text_log_probs)
-    texts, text_log_probs, text_lens = mask_in_place_and_calc_length(texts, text_log_probs, eos_token, pad_token)
-    print('text_lens:', text_lens)
-    print(texts)
-    print(text_log_probs)
-
-testing()
-
-
-# # WIP Faster Generator
-
-# In[3]:
-
-
-class TextGenerator(nn.Module):
-    """Load weights from faster_text_gen_v1.pth"""
-
-    def __init__(self, d_vocab, d_text_feature, d_gen_hidden, d_max_seq_len, d_gen_layers=1, gen_dropout=0, pad_token=0, start_token=-1, end_token=-1):
-        super().__init__()
-
-        assert start_token >= 0 and start_token < d_vocab
-        assert end_token >= 0 and end_token < d_vocab
-        assert pad_token >= 0 and pad_token < d_vocab
-
-        self.d_vocab = d_vocab
-        self.pad_token = pad_token
-        self.end_token = end_token
-        self.start_token = start_token
-        self.gen_dropout = gen_dropout
-        self.d_gen_layers = d_gen_layers
-        self.d_gen_hidden = d_gen_hidden
-        self.d_max_seq_len = d_max_seq_len
-        self.d_text_feature = d_text_feature
-
-        self.define_module()
-
-    def define_module(self):
-        self.embed = nn.Embedding(self.d_vocab, self.d_text_feature)
-        self.rnn_cell = nn.LSTM(self.d_text_feature, self.d_gen_hidden, self.d_gen_layers, dropout=(0 if self.d_gen_layers == 1 else self.gen_dropout), batch_first=True)
-        self.drop = nn.Dropout(self.gen_dropout)
-        self.fc_logits = nn.Linear(self.d_gen_hidden, self.d_vocab)
-        self.log_soft = nn.LogSoftmax(dim=-1)
-
-    def step(self, xs, hs):
-        xs, hs = self.rnn_cell(xs, hx=hs)
-        log_probs = self.log_soft(self.fc_logits(self.drop(xs)))
-        return log_probs, hs # (d_batch, 1, d_vocab), ((1, d_batch, d_gen_hidden), (1, d_batch, d_gen_hidden))
-
-    def forward(self, text_features):
-        '''
-        encoded : (batch_size, feat_size)
-        seq: (batch_size, seq_len)
-        lengths: (batch_size, )
-        '''
-        d_batch = text_features.size(0)
-        device = text_features.device
-        d_max_seq_len = self.d_max_seq_len
-
-        text_log_probs = torch.zeros(d_batch, d_max_seq_len, self.d_vocab, device=device)
-        text_log_probs[:, 0, :] = torch.log(to_one_hot(torch.tensor(self.start_token), self.d_vocab))[None, :]
-        texts = torch.full((d_batch, d_max_seq_len), self.pad_token, dtype=torch.long, device=device)
-        texts[:, 0] = self.start_token
-        hs = None
-
-        for i in range(1, d_max_seq_len):
-            if i > 1:
-                word_embeddings = self.embed(words) # (d_batch, 1) -> (d_batch, 1, d_text_feature)
-            else:
-                word_embeddings = text_features.unsqueeze(1) # (d_batch, d_text_feature) -> (d_batch, 1, d_text_feature)
-            log_probs, hs = self.step(word_embeddings, hs)
-            log_probs = log_probs.squeeze(1) # (d_batch, 1, d_vocab) -> (d_batch, 1, d_vocab)
-            text_log_probs[:, i] = log_probs
-            words = torch.multinomial(torch.exp(log_probs), 1)
-            texts[:, i] = words.squeeze(1) # (d_batch, 1) -> (d_batch,)
-
-        texts, text_log_probs, text_lens = mask_in_place_and_calc_length(texts, text_log_probs, self.end_token, self.pad_token)
-        return texts, text_log_probs, text_lens
-
-def test_text_generator():
-    d_batch = 4
-    d_max_seq_len = 52
-    d_text_feature = 512
-    d_gen_hidden = 512
-    gen_dropout = 0.5
-    d_gen_layers = 1
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-#     dataset, _ = get_emnlp_2017_news_pretrained_vocab(d_batch=d_batch, should_pad=True, pad_to_length=d_max_seq_len)
-    dataset, _ = get_quora_texts_pretrained_vocab(d_batch=d_batch, should_pad=True, pad_to_length=d_max_seq_len)
-
-    text_gen = TextGenerator(d_vocab=dataset.d_vocab, d_text_feature=d_text_feature, d_gen_hidden=d_gen_hidden, d_max_seq_len=dataset.d_max_seq_len, d_gen_layers=d_gen_layers, gen_dropout=gen_dropout, pad_token=dataset.pad_token, start_token=dataset.start_token, end_token=dataset.end_token)
-    text_gen.load_state_dict(torch.load('faster_text_gen_v1.pth'))
-    text_gen.to(device).train()
-
-    xs = torch.randn(d_batch, d_text_feature, device=device)
-
-    texts, text_log_probs, text_lens = text_gen(xs)
-    assert texts.size() == (d_batch, d_max_seq_len) and texts.dtype == torch.long
-    assert text_log_probs.size() == (d_batch, d_max_seq_len, dataset.d_vocab) and text_log_probs.dtype == torch.float
-    assert text_lens.size() == (d_batch,) and text_lens.dtype == torch.long
-
-    for text in texts:
-        print(dataset.decode_caption(text))
-        print('-'*64)
-    print('#'*64)
-    for text in text_log_probs.argmax(dim=2):
-        print(dataset.decode_caption(text))
-        print('-'*64)
-
-test_text_generator()
-
-
-# # Discriminator
-
-# In[4]:
-
-
-def test_text_enc():
-    d_batch = 4
-    d_max_seq_len = 52
-
-    quora_checkpoint = torch.load(QUORA_PARAPHRASE_PRETRAINED_CHECKPOINT_PATH)
-    quora_default_args = torch.load(QUORA_PARAPHRASE_PRETRAINED_DEFAULT_CONFIG_PATH)
-    quora_word_id_to_word = torch.load(QUORA_PARAPHRASE_PRETRAINED_WORD_ID_TO_WORD_PATH)
-    word_id_to_word = quora_word_id_to_word
-    d_vocab = len(word_id_to_word)
-
-    args = edict(quora_default_args)
-    d_text_feature = args.txtSize
-    text_enc = HybridCNNLong(d_vocab, args.txtSize, dropout=args.drop_prob_lm, avg=1, cnn_dim=args.cnn_dim)
-    text_enc.load_state_dict(quora_checkpoint['encoder_state_dict'])
-    assert text_enc
-
-    texts = torch.randn(d_batch, d_max_seq_len, d_vocab)
-    text_features = text_enc(texts)
-    assert text_features.size() == (d_batch, d_text_feature) and text_features.dtype == torch.float
-
-test_text_enc()
-
-
-# In[5]:
-
-
-class TextDiscriminator(nn.Module):
-    """An LSTM discriminator that operates on word indexes."""
-
-    def __init__(self, d_vocab, d_text_feature, dis_dropout, d_dis_cnn, **kwargs):
-        super().__init__()
-        self.d_vocab = d_vocab
-        self.d_text_feature = d_text_feature
-        self.dis_dropout = dis_dropout
-        self.d_dis_cnn = d_dis_cnn
-        self.define_module()
-
-    def define_module(self):
-        self.text_enc = HybridCNNLong(self.d_vocab, self.d_text_feature, dropout=self.dis_dropout, avg=1, cnn_dim=self.d_dis_cnn)
-        self.fc_logits = nn.Linear(self.d_text_feature, 1)
-
-    def forward(self, sequence):
-        text_features = self.text_enc(sequence)
-        valids = self.fc_logits(text_features).squeeze(1)
-        return text_features, valids
-
-def test_text_disciminator():
-    d_batch = 4
-    d_max_seq_len = 52
-    quora_default_args = torch.load(QUORA_PARAPHRASE_PRETRAINED_DEFAULT_CONFIG_PATH)
-    quora_word_id_to_word = torch.load(QUORA_PARAPHRASE_PRETRAINED_WORD_ID_TO_WORD_PATH)
-    word_id_to_word = quora_word_id_to_word
-    d_vocab = len(word_id_to_word)
-    args = edict(quora_default_args)
-    d_text_feature = args.txtSize
-    dis_dropout = args.drop_prob_lm
-    d_dis_cnn = args.cnn_dim
-
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    text_dis = TextDiscriminator(d_vocab=d_vocab, d_text_feature=d_text_feature, dis_dropout=dis_dropout, d_dis_cnn=d_dis_cnn).to(device).train()
-    text_dis.load_state_dict(torch.load('faster_text_dis_v1.pth'))
-    assert text_dis
-
-    texts = torch.randint(low=0, high=d_vocab, size=(d_batch, d_max_seq_len)).to(device)
-    text_features, valids = text_dis(to_one_hot(texts, d_vocab))
-    assert text_features.size() == (d_batch, d_text_feature) and text_features.dtype == torch.float
-    assert valids.size() == (d_batch,) and valids.dtype == torch.float
-
-    text_log_probs = -torch.rand(d_batch, d_max_seq_len, d_vocab).to(device)
-    text_features, valids = text_dis(text_log_probs)
-    assert text_features.size() == (d_batch, d_text_feature) and text_features.dtype == torch.float
-    assert valids.size() == (d_batch,) and valids.dtype == torch.float
-
-test_text_disciminator()
-
-
-# Batch discriminator
-
-
-class BatchTextDiscriminator(nn.Module):
-    def __init__(self, d_text_feature, **kwargs):
-        super().__init__()
-        self.d_text_feature = d_text_feature
-        self.define_module()
-
-    def define_module(self):
-        self.batch_logit = nn.Linear(2*self.d_text_feature, 1)
-
-    def forward(self, text_features):
-        batch_valid = self.batch_logit(torch.cat((text_features.mean(dim=0), text_features.std(dim=0)), dim=0).unsqueeze(0)).squeeze(0)
-        return batch_valid
-
-def test_batch_text_disciminator():
-    d_batch = 4
-    d_max_seq_len = 52
-    quora_default_args = torch.load(QUORA_PARAPHRASE_PRETRAINED_DEFAULT_CONFIG_PATH)
-    quora_word_id_to_word = torch.load(QUORA_PARAPHRASE_PRETRAINED_WORD_ID_TO_WORD_PATH)
-    word_id_to_word = quora_word_id_to_word
-    d_vocab = len(word_id_to_word)
-    args = edict(quora_default_args)
-    d_text_feature = args.txtSize
-    dis_dropout = args.drop_prob_lm
-    d_dis_cnn = args.cnn_dim
-
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    text_dis = TextDiscriminator(d_vocab=d_vocab, d_text_feature=d_text_feature, dis_dropout=dis_dropout, d_dis_cnn=d_dis_cnn).to(device).train()
-    text_dis.load_state_dict(torch.load('faster_text_dis_v1.pth'))
-    assert text_dis
-
-    texts = torch.randint(low=0, high=d_vocab, size=(d_batch, d_max_seq_len)).to(device)
-    text_features, valids = text_dis(to_one_hot(texts, d_vocab))
-    assert text_features.size() == (d_batch, d_text_feature) and text_features.dtype == torch.float
-    assert valids.size() == (d_batch,) and valids.dtype == torch.float
-
-    text_log_probs = -torch.rand(d_batch, d_max_seq_len, d_vocab).to(device)
-    text_features, valids = text_dis(text_log_probs)
-    assert text_features.size() == (d_batch, d_text_feature) and text_features.dtype == torch.float
-    assert valids.size() == (d_batch,) and valids.dtype == torch.float
-
-    batch_text_dis = BatchTextDiscriminator(d_text_feature=d_text_feature).to(device).train()
-    batch_valid = batch_text_dis(text_features)
-    assert batch_valid.size() == (1,) and batch_valid.dtype == torch.float
-
-test_batch_text_disciminator()
 
 
 # # Training
@@ -310,7 +32,7 @@ test_batch_text_disciminator()
 # In[6]:
 
 
-def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_dir, references=None, text_gen_opt_weights_path=None, text_dis_opt_weights_path=None,
+def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_dir, references=None, text_dec_opt_weights_path=None, text_enc_opt_weights_path=None,
     d_batch=512,
     num_epochs=20,
     gen_beta1=0.5,
@@ -325,22 +47,22 @@ def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_
 
     assert references is not None
 
-    end_token = text_gen.end_token
-    def remove_padding_helper(xs):
-        xs = xs[1:] # remove start_token
+    end_token = dataset.end_token
+    def remove_helper(xs):
+        xs = xs[1:]
         for i, x in enumerate(xs):
             if x == end_token:
-                return xs[:i] # remove end and pad tokens
+                return xs[:i]
         return xs
-
-    def remove_padding(xss):
+    def remove_special_tokens(xss):
         if isinstance(xss, torch.Tensor):
             xss = xss.tolist()
-        return [remove_padding_helper(xs) for xs in xss]
+        return [remove_helper(xs) for xs in xss]
 
     d_vocab = dataset.d_vocab
     d_max_seq_len = dataset.d_max_seq_len
-    d_text_feature = text_dis.d_text_feature
+    d_text_feature = lat_gen.d_text_feature
+    d_noise = lat_gen.d_noise
 
     text_enc.train()
     text_dec.train()
@@ -354,8 +76,6 @@ def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_
 
     text_dec_opt = optim.Adam(text_dec.parameters())
     text_enc_opt = optim.Adam(text_enc.parameters())
-#     text_gen_opt = optim.Adam(text_gen.parameters(), lr=gen_lr, betas=(gen_beta1, 0.999), weight_decay=gen_weight_decay)
-#     text_dis_opt = optim.Adam(text_dis.parameters(), lr=dis_lr, betas=(dis_beta1, 0.999), weight_decay=dis_weight_decay)
     if text_dec_opt_weights_path:
         text_dec_opt.load_state_dict(torch.load(text_dec_opt_weights_path))
     if text_enc_opt_weights_path:
@@ -368,7 +88,7 @@ def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_
     text_enc_real_scores = []
     text_enc_fake_scores = []
 
-    fixed_noises = torch.randn(d_batch, d_text_feature, device=device)
+    fixed_noises = torch.randn(d_batch, d_noise, device=device)
     bleu_scores = {n:[] for n in range(1, 6)} # calculate BLEU 1 to 5 scores
     best_bleu_scores = {n: -1.0 for n in range(1, 6)}
 
@@ -387,19 +107,19 @@ def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_
             real_texts, _ = batch
             real_texts = real_texts.to(device)
             with torch.no_grad():
-                fake_latents = lat_gen(torch.randn(d_batch, d_text_feature, device=device))
+                fake_latents = lat_gen(torch.randn(d_batch, d_noise, device=device))
             fake_texts, fake_text_log_probs, _ = text_dec(fake_latents)
 
             # train discriminator
             text_enc.zero_grad()
             text_features = text_enc(to_one_hot(real_texts, d_vocab))
-            valids = text_dis(text_features)
+            valids = lat_dis(text_features)
             text_enc_real_loss = criterion(valids, real_targets)
             text_enc_real_loss.backward()
             epoch_real_score += valids.mean().item()
 
             text_features = text_enc(to_one_hot(fake_texts, d_vocab))
-            valids = text_dis(text_features)
+            valids = lat_dis(text_features)
             text_enc_fake_loss = criterion(valids, fake_targets)
             text_enc_fake_loss.backward()
             epoch_fake_score += valids.mean().item()
@@ -438,16 +158,18 @@ def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_
         print('\n'.join([dataset.decode_caption(real_text) for real_text in real_texts.cpu()[:4]]))
         print('fake texts')
         with torch.no_grad():
-            text_gen.eval()
-            fake_texts = text_gen(noises)[0]
-            text_gen.train()
+            lat_gen.eval()
+            text_dec.eval()
+            fake_texts = text_dec(lat_gen(fixed_noises))[0]
+            lat_gen.train()
+            text_dec.train()
         fake_text_strs = [dataset.decode_caption(fake_text) for fake_text in fake_texts.cpu()]
         print('\n'.join(fake_text_strs[:4]))
         with open(f'{output_dir}/epoch_{epoch}.txt', 'w') as f:
             f.write('\n'.join(fake_text_strs))
 
         # calculate BLEU 1 to 5
-        hypos = remove_padding(fake_texts)
+        hypos = remove_special_tokens(fake_texts)
         for n in range(1, 6):
             weight = tuple(1. / n for _ in range(n))
             bleu_score = sum(sentence_bleu(references, hypo, weight) for hypo in hypos) / len(hypos) # smoothing_function=chencherry.method1)
@@ -458,25 +180,24 @@ def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_
                 print('improved BLEU', n,'score from', best, 'to', bleu_score)
                 best_bleu_scores[n] = bleu_score
                 print('saving best models:')
-                torch.save(text_gen.state_dict(), f'{output_dir}/bleu_{n}_text_gen.pth')
-                torch.save(text_dis.state_dict(), f'{output_dir}/bleu_{n}_text_dis.pth')
-                torch.save(batch_text_dis.state_dict(), f'{output_dir}/bleu_{n}_batch_text_dis.pth')
-                torch.save(text_gen_opt.state_dict(), f'{output_dir}/bleu_{n}_text_gen_opt.pth')
-                torch.save(text_dis_opt.state_dict(), f'{output_dir}/bleu_{n}_text_dis_opt.pth')
+                torch.save(text_dec.state_dict(), f'{output_dir}/bleu_{n}_text_dec.pth')
+                torch.save(text_enc.state_dict(), f'{output_dir}/bleu_{n}_text_enc.pth')
+                torch.save(text_dec_opt.state_dict(), f'{output_dir}/bleu_{n}_text_dec_opt.pth')
+                torch.save(text_enc_opt.state_dict(), f'{output_dir}/bleu_{n}_text_enc_opt.pth')
 
         plt.close('all')
         plt.figure(figsize=(3*5, 4))
         xs = torch.arange(1, epoch+1)
 
         plt.subplot(1, 3, 1)
-        plt.plot(xs, list(zip(text_gen_losses, text_dis_losses)))
+        plt.plot(xs, list(zip(text_dec_losses, text_enc_losses)))
         plt.xlabel('epochs')
         plt.ylabel('loss')
         plt.legend(['text gen', 'text dis'])
         plt.title('losses')
 
         plt.subplot(1, 3, 2)
-        plt.plot(xs, list(zip(text_dis_real_scores, text_dis_fake_scores)))
+        plt.plot(xs, list(zip(text_enc_real_scores, text_enc_fake_scores)))
         plt.xlabel('epochs')
         plt.ylabel('logit/score')
         plt.legend(['real', 'fake'])
@@ -494,18 +215,13 @@ def train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_
         plt.show()
 
         with open(f'{output_dir}/metrics.json', 'w') as f:
-            json.dump(dict(text_gen_losses=text_gen_losses, text_dis_losses=text_dis_losses, text_dis_real_scores=text_dis_real_scores, text_dis_fake_scores=text_dis_fake_scores, bleu_scores=bleu_scores), f)
+            json.dump(dict(text_dec_losses=text_dec_losses, text_enc_losses=text_enc_losses, text_enc_real_scores=text_enc_real_scores, text_enc_fake_scores=text_enc_fake_scores, bleu_scores=bleu_scores), f)
 
         print('saving latest models:')
-        torch.save(text_gen.state_dict(), f'{output_dir}/latest_text_gen.pth')
-        torch.save(text_dis.state_dict(), f'{output_dir}/latest_text_dis.pth')
-        torch.save(batch_text_dis.state_dict(), f'{output_dir}/latest_batch_text_dis.pth')
-        torch.save(text_gen_opt.state_dict(), f'{output_dir}/latest_text_gen_opt.pth')
-        torch.save(text_dis_opt.state_dict(), f'{output_dir}/latest_text_dis_opt.pth')
-
-
-# In[7]:
-
+        torch.save(text_dec.state_dict(), f'{output_dir}/latest_text_dec.pth')
+        torch.save(text_enc.state_dict(), f'{output_dir}/latest_text_enc.pth')
+        torch.save(text_dec_opt.state_dict(), f'{output_dir}/latest_text_dec_opt.pth')
+        torch.save(text_enc_opt.state_dict(), f'{output_dir}/latest_text_enc_opt.pth')
 
 def read_and_update_config(config=None):
     defaults = dict(
@@ -524,8 +240,6 @@ def read_and_update_config(config=None):
         no_start_end=False,
         num_workers=0,
         num_fast_bleu_references=256,
-        text_gen_weights_path='faster_text_gen_v1.pth',
-        text_dis_weights_path='faster_text_dis_v1.pth',
     )
     if config is not None:
         if isinstance(config, str):
@@ -536,10 +250,6 @@ def read_and_update_config(config=None):
             assert isinstance(config, dict)
         defaults.update(config)
     return defaults
-
-
-# In[8]:
-
 
 def run(config, output_dir):
     config = read_and_update_config(config)
@@ -560,14 +270,25 @@ def run(config, output_dir):
     print('num validation set BLEU references:', len(references))
 
     print('constructing models:')
-    args = edict(torch.load(QUORA_PARAPHRASE_PRETRAINED_DEFAULT_CONFIG_PATH))
-    assert args.input_encoding_size == args.txtSize
-    d_text_feature = args.txtSize
-    dis_dropout = args.drop_prob_lm
-    d_dis_cnn = args.cnn_dim
-    d_gen_hidden = args.rnn_size
-    d_gen_layers = args.rnn_layers
-    gen_dropout = args.drop_prob_lm
+    d_batch = 512
+    d_noise = 100
+    d_vocab = 27699
+    num_epochs = 50
+    start_epoch = 1
+    d_gen_layers = 1
+    gen_dropout = 0.5
+    d_max_seq_len = 26
+    d_gen_hidden = 512
+    d_dis_hidden = 512
+    d_text_feature = 512
+    d_text_enc_cnn = 512
+    d_text_enc_cnn = 512
+    text_enc_dropout = 0.5
+    text_enc_weights_path = 'new_text_enc.pth'
+    text_dec_weights_path = 'faster_text_gen_v1.pth'
+    lat_gen_weights_path = 'run_12_all_fixed/epoch_46_lat_gen.pth'
+    lat_dis_weights_path = 'run_12_all_fixed/epoch_46_lat_dis.pth'
+    references_path = QUORA_TEXT_PRETRAINED_VOCAB_VALID_SET_PATH
 
     text_enc = TextEncoder(d_vocab=d_vocab, d_text_feature=d_text_feature, text_enc_dropout=text_enc_dropout, d_text_enc_cnn=d_text_enc_cnn).to(device)
     text_enc.load_state_dict(torch.load(text_enc_weights_path))
@@ -575,7 +296,9 @@ def run(config, output_dir):
     text_dec.load_state_dict(torch.load(text_dec_weights_path))
 
     lat_dis = LatentDiscriminator(d_text_feature=d_text_feature, d_dis_hidden=d_dis_hidden).to(device)
+    lat_dis.load_state_dict(torch.load(lat_dis_weights_path))
     lat_gen = LatentGenerator(d_noise=d_noise, d_text_feature=d_text_feature, d_gen_hidden=d_gen_hidden).to(device)
+    lat_gen.load_state_dict(torch.load(lat_gen_weights_path))
 
     print('training:')
     train(lat_gen, text_dec, text_enc, lat_dis, dataset, loader, device, output_dir=output_dir, references=references, **config)
@@ -585,5 +308,5 @@ def run(config, output_dir):
 # # Runs
 
 if __name__ == '__main__':
-    run(config=dict(num_epochs=50), output_dir='run_11/')
+    run(config=dict(num_epochs=50), output_dir='run_13/')
 # # End
