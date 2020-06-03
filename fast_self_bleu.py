@@ -26,12 +26,6 @@ def pre_calc_max_cnts(refs, n):
                     max_cnt[ngram] = (i1, c1, i, cnt)
     return max_cnt
 
-def exclude_ref(max_cnt, i):
-    res = Counter()
-    for ngram, (i1, c1, i2, c2) in max_cnt.items():
-        res[ngram] = c1 if i != i1 else c2
-    return res
-
 def best_match_len(refs, hypo):
     min_diff = 10000
     hlen = len(hypo)
@@ -47,12 +41,12 @@ def brevity(refs, hypo):
     r = best_match_len(refs, hypo)
     return min(1.0, np.exp(1 - (r/len(hypo))))
 
-def get_clipped_score_using_pre_calc(max_cnt, hypo, n):
+def get_clipped_score_using_pre_calc_excluding_ref(max_cnt, hypo, i, n):
     hypo_cnt = Counter(get_ngrams(hypo, n))
-    return sum(min(cnt, max_cnt[ngram]) for ngram, cnt in hypo_cnt.items())
+    return sum(min(cnt, max_cnt[ngram][1]) if i != max_cnt[ngram][0] else min(cnt, max_cnt[ngram][3]) for ngram, cnt in hypo_cnt.items())
 
-def mod_pre_using_pre_calc(max_cnt, hypo, n):
-    score = get_clipped_score_using_pre_calc(max_cnt, hypo, n)
+def mod_pre_using_pre_calc_excluding_ref(max_cnt, hypo, i, n):
+    score = get_clipped_score_using_pre_calc_excluding_ref(max_cnt, hypo, i, n)
     total = len(hypo) - n + 1
     return score/total
 
@@ -63,7 +57,7 @@ def self_bleu(hypos, N):
         if len(hypo) < N:
             scores.append(0.0)
         else:
-            ps = [mod_pre_using_pre_calc(exclude_ref(max_cnt, i), hypo, n) for n, max_cnt in enumerate(max_cnts, start=1)]
+            ps = [mod_pre_using_pre_calc_excluding_ref(max_cnt, hypo, i, n) for n, max_cnt in enumerate(max_cnts, start=1)]
             bp = brevity(hypos[:i] + hypos[i+1:], hypo) if len(hypo) > 0 else 0.0
             scores.append(np.prod(ps)**(1.0/N) * bp)
     return scores
@@ -73,7 +67,7 @@ def all_self_bleu(hypos, N):
     scores = []
     for i, hypo in enumerate(tqdm(hypos)):
         hlen = len(hypo)
-        ps = [mod_pre_using_pre_calc(exclude_ref(max_cnt, i), hypo, n) if hlen >= n else 0.0 for n, max_cnt in enumerate(max_cnts, start=1)]
+        ps = [mod_pre_using_pre_calc_excluding_ref(max_cnt, hypo, i, n) if hlen >= n else 0.0 for n, max_cnt in enumerate(max_cnts, start=1)]
         bp = brevity(hypos[:i] + hypos[i+1:], hypo) if len(hypo) > 0 else 0.0
         scores.append([(np.prod(ps[:n])**(1.0/n) * bp) for n in range(1, N+1)])
     return scores
